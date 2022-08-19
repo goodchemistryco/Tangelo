@@ -50,6 +50,7 @@ backend_info["qiskit"] = {"statevector_available": True, "statevector_order": "m
 backend_info["qulacs"] = {"statevector_available": True, "statevector_order": "msq_first", "noisy_simulation": True}
 backend_info["cirq"] = {"statevector_available": True, "statevector_order": "lsq_first", "noisy_simulation": True}
 backend_info["qdk"] = {"statevector_available": False, "statevector_order": None, "noisy_simulation": False}
+backend_info["qiskit_device"] = {"statevector_available": False, "statevector_order": "msq_first", "noisy_simulation": True}
 
 
 class Simulator:
@@ -86,7 +87,7 @@ class Simulator:
         if not self.n_shots and (not self.statevector_available or self._noise_model):
             raise ValueError("A number of shots needs to be specified.")
 
-    def simulate(self, source_circuit, return_statevector=False, initial_statevector=None):
+    def simulate(self, source_circuit, return_statevector=False, initial_statevector=None, qubits_to_use=None, opt_level=1, meas_mitt=False):
         """Perform state preparation corresponding to the input circuit on the
         target backend, return the frequencies of the different observables, and
         either the statevector or None depending on the availability of the
@@ -101,7 +102,11 @@ class Simulator:
             return_statevector(bool): option to return the statevector as well,
                 if available.
             initial_statevector(list/array) : A valid statevector in the format
-                supported by the target backend.
+                supported by the target backend
+            qubits_to_use (list): List of qubits to use for simulation. Must have
+                same length as number of qubits in the circuit.
+            opt_level (int): optimization level 0,1,2,3
+            meas_mitt (bool): use measurement_error_mitigation.
 
         Returns:
             dict: A dictionary mapping multi-qubit states to their corresponding
@@ -230,6 +235,80 @@ class Simulator:
                            if v > self.freq_threshold}
             return (frequencies, None)
 
+        elif self._target == "qiskit_device":
+            import qiskit
+            from qiskit.test import mock
+            from qiskit.providers.aer import AerSimulator
+            from qiskit.ignis.mitigation.measurement import complete_meas_cal, CompleteMeasFitter
+
+            translated_circuit, q, c = translator.translate_qiskit(source_circuit, qubits_to_use, return_registers=True)
+
+            # If requested, set initial state
+            if initial_statevector is not None:
+                raise ValueError("Cannot load an initial state if using a noise model, with Qiskit")
+
+            # Drawing individual shots with the qasm simulator, for noisy simulation or simulating mixed states
+            num_measure_qubits = len(qubits_to_use) if qubits_to_use is not None else source_circuit.width
+            translated_circuit.measure(q, c)
+
+            virtual_to_physical = dict()
+            qubit_map = qubits_to_use if qubits_to_use is not None else [i for i in range(num_measure_qubits)]
+            if len(qubit_map) != num_measure_qubits:
+                raise ValueError("number of qubits_to_use must equal number of qubits in circuit")
+            for i in range(num_measure_qubits):
+                virtual_to_physical[q[i]] = qubit_map[i]
+
+            return_statevector = False
+            if self._noise_model is not None and self._noise_model._device_name is not None:
+                try:
+                    device_to_call = getattr(mock, self._noise_model._device_name)
+                except AttributeError:
+                    raise ValueError(f"{self._noise_model._device_name} is not one of the Fake Qiskit backends")
+            else:
+                raise ValueError("_device_name must be included in a noise_model to run a simulated device")
+            device_backend = device_to_call()
+            backend = AerSimulator.from_backend(device_backend)
+
+            if meas_mitt:
+                meas_calibs, state_labels = complete_meas_cal(qr=q, circlabel='mcal')
+                t_qc = qiskit.transpile(meas_calibs, backend, initial_layout=virtual_to_physical)
+                qobj = qiskit.assemble(t_qc, shots=10000)
+                cal_results = backend.run(qobj, shots=10000).result()
+                meas_fitter = CompleteMeasFitter(cal_results, state_labels, circlabel='mcal')
+                meas_filter = meas_fitter.filter
+
+            job_sim = qiskit.execute(qiskit.transpile(translated_circuit, backend, initial_layout=virtual_to_physical, optimization_level=opt_level), backend,
+                                     shots=self.n_shots, basis_gates=None)
+            if meas_mitt:
+                presim_results = job_sim.result()
+                sim_results = meas_filter.apply(presim_results)
+            else:
+                sim_results = job_sim.result()
+
+            frequencies = {state[::-1]: count/self.n_shots for state, count in sim_results.get_counts(0).items()}
+
+            return (frequencies, np.array(sim_results.get_statevector())) if return_statevector else (frequencies, None)
+
+        elif self._target == "qdk":
+
+            translated_circuit = translator.translate_qsharp(source_circuit)
+            with open('tmp_circuit.qs', 'w+') as f_out:
+                f_out.write(translated_circuit)
+
+            # Compile, import and call Q# operation to compute frequencies. Only import qsharp module if qdk is running
+            # TODO: A try block to catch an exception at compile time, for Q#? Probably as an ImportError.
+            import qsharp
+            qsharp.reload()
+            from MyNamespace import EstimateFrequencies
+            frequencies_list = EstimateFrequencies.simulate(nQubits=source_circuit.width, nShots=self.n_shots)
+            print("Q# frequency estimation with {0} shots: \n {1}".format(self.n_shots, frequencies_list))
+
+            # Convert Q# output to frequency dictionary, apply threshold
+            frequencies = {bin(i).split('b')[-1]: frequencies_list[i] for i, freq in enumerate(frequencies_list)}
+            frequencies = {("0"*(source_circuit.width-len(k))+k)[::-1]: v for k, v in frequencies.items()
+                           if v > self.freq_threshold}
+            return (frequencies, None)
+
         elif self._target == "cirq":
             import cirq
 
@@ -264,7 +343,7 @@ class Simulator:
 
             return (frequencies, np.array(self._current_state)) if return_statevector else (frequencies, None)
 
-    def get_expectation_value(self, qubit_operator, state_prep_circuit, initial_statevector=None):
+    def get_expectation_value(self, qubit_operator, state_prep_circuit, initial_statevector=None, qubits_to_use=None, opt_level=1, meas_mitt=False):
         r"""Take as input a qubit operator H and a quantum circuit preparing a
         state |\psi>. Return the expectation value <\psi | H | \psi>.
 
@@ -279,6 +358,9 @@ class Simulator:
             qubit_operator(openfermion-style QubitOperator class): a qubit
                 operator.
             state_prep_circuit: an abstract circuit used for state preparation.
+            qubits_to_use (list): list of physical qubits to use
+            opt_level (int): optimation level 0,1,2,3
+            meas_mitt (bool): Whether to use measurement_error_mitigation
 
         Returns:
             complex: The expectation value of this operator with regards to the
@@ -301,7 +383,8 @@ class Simulator:
         if are_coefficients_real:
             if self._noise_model or not self.statevector_available \
                     or state_prep_circuit.is_mixed_state or state_prep_circuit.size == 0:
-                return self._get_expectation_value_from_frequencies(qubit_operator, state_prep_circuit, initial_statevector=initial_statevector)
+                return self._get_expectation_value_from_frequencies(qubit_operator, state_prep_circuit, initial_statevector=initial_statevector,
+                                                                    qubits_to_use=qubits_to_use, opt_level=opt_level, meas_mitt=meas_mitt)
             elif self.statevector_available:
                 return self._get_expectation_value_from_statevector(qubit_operator, state_prep_circuit, initial_statevector=initial_statevector)
 
@@ -312,8 +395,10 @@ class Simulator:
                 qb_op_real.terms[term], qb_op_imag.terms[term] = coef.real, coef.imag
             qb_op_real.compress()
             qb_op_imag.compress()
-            exp_real = self.get_expectation_value(qb_op_real, state_prep_circuit, initial_statevector=initial_statevector)
-            exp_imag = self.get_expectation_value(qb_op_imag, state_prep_circuit, initial_statevector=initial_statevector)
+            exp_real = self.get_expectation_value(qb_op_real, state_prep_circuit, initial_statevector=initial_statevector,
+                                                  qubits_to_use=qubits_to_use, opt_level=opt_level, meas_mitt=meas_mitt)
+            exp_imag = self.get_expectation_value(qb_op_imag, state_prep_circuit, initial_statevector=initial_statevector,
+                                                  qubits_to_use=qubits_to_use, opt_level=opt_level, meas_mitt=meas_mitt)
             return exp_real if (exp_imag == 0.) else exp_real + 1.0j * exp_imag
 
     def _get_expectation_value_from_statevector(self, qubit_operator, state_prep_circuit, initial_statevector=None):
@@ -397,7 +482,8 @@ class Simulator:
 
         return expectation_value
 
-    def _get_expectation_value_from_frequencies(self, qubit_operator, state_prep_circuit, initial_statevector=None):
+    def _get_expectation_value_from_frequencies(self, qubit_operator, state_prep_circuit, initial_statevector=None,
+                                                qubits_to_use=None, opt_level=1, meas_mitt=False):
         r"""Take as input a qubit operator H and a state preparation returning a
         ket |\psi>. Return the expectation value <\psi | H | \psi> computed
         using the frequencies of observable states.
@@ -406,6 +492,9 @@ class Simulator:
             qubit_operator(openfermion-style QubitOperator class): a qubit
                 operator.
             state_prep_circuit: an abstract circuit used for state preparation.
+            qubits_to_use (list): list of physical qubits to use on device
+            opt_level (int): Optimization level for compiling 0,1,2,3
+            meas_mitt (bool): Whether to use measurement_error_mitigation
 
         Returns:
             complex: The expectation value of this operator with regards to the
@@ -420,7 +509,8 @@ class Simulator:
                 updated_statevector = initial_statevector
         else:
             initial_circuit = Circuit(n_qubits=n_qubits)
-            _, updated_statevector = self.simulate(state_prep_circuit, return_statevector=True, initial_statevector=initial_statevector)
+            _, updated_statevector = self.simulate(state_prep_circuit, return_statevector=True, initial_statevector=initial_statevector,
+                                                   qubits_to_use=qubits_to_use, opt_level=opt_level, meas_mitt=meas_mitt)
 
         expectation_value = 0.
         for term, coef in qubit_operator.terms.items():
@@ -433,7 +523,8 @@ class Simulator:
 
             basis_circuit = Circuit(measurement_basis_gates(term))
             full_circuit = initial_circuit + basis_circuit if (basis_circuit.size > 0) else initial_circuit
-            frequencies, _ = self.simulate(full_circuit, initial_statevector=updated_statevector)
+            frequencies, _ = self.simulate(full_circuit, initial_statevector=updated_statevector,
+                                           qubits_to_use=qubits_to_use, opt_level=opt_level, meas_mitt=meas_mitt)
             expectation_term = self.get_expectation_value_from_frequencies_oneterm(term, frequencies)
             expectation_value += coef * expectation_term
 

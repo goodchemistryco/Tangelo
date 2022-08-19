@@ -15,7 +15,6 @@
 """Generic noise model representation and backend-specific translation function.
 The Simulator class is responsible for taking in the generic noise model at
 runtime and applying it accordingly to the target compute backend.
-
 Only works for simulators supporting noisy simulation.
 """
 
@@ -44,8 +43,9 @@ class NoiseModel:
     description of the different noise channels.
     """
 
-    def __init__(self):
+    def __init__(self, device_name=None):
         self._quantum_errors = dict()
+        self._device_name = device_name
 
     def __repr__(self):
         return str(self._quantum_errors)

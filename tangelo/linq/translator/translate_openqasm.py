@@ -93,6 +93,7 @@ def _translate_openqasm2abs(openqasm_str):
             return s
 
     # Get number of qubits, extract gate operations
+    print(openqasm_str)
     n_qubits = int(re.findall('qreg q\[(\d+)\];', openqasm_str)[0])
     openqasm_gates = openqasm_str.split(f"qreg q[{n_qubits}];\ncreg c[{n_qubits}];")[-1]
     openqasm_gates = [instruction for instruction in openqasm_gates.split("\n") if instruction]
