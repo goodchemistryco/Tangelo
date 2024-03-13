@@ -9,8 +9,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11"]
-    
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
     defaults:
       run:
         shell: bash -el {0}
@@ -40,7 +40,7 @@ jobs:
         pip install rdkit
         pip install openbabel-wheel
         conda install -c conda-forge openmm
-    
+
     - name: Install qulacs
       run: |
         pip install qulacs
