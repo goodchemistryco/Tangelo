@@ -252,6 +252,9 @@ class VQESolverTest(unittest.TestCase):
 
         energy = vqe_solver.simulate()
         self.assertAlmostEqual(energy, -1.97783, delta=1e-4)
+        # Test that the number of variational parameters is less than the total possible number
+        self.assertEqual(vqe_solver.ansatz.n_var_params, 10)
+        self.assertEqual(vqe_solver.ansatz.n_full_var_params, 14)
 
     def test_simulate_qmf_h4(self):
         """Run VQE on H4 molecule, with QMF ansatz, JW qubit mapping, initial
@@ -332,7 +335,7 @@ class VQESolverTest(unittest.TestCase):
         energy = vqe_solver.simulate()
         self.assertAlmostEqual(energy, -1.6394, delta=1e-3)
 
-    def test_simulate_h4_open(self):
+    def test_simulate_h4_uhf_a1_frozen(self):
         """Run VQE on H4 molecule, with UCCSD ansatz, scbk qubit mapping, initial parameters, exact simulator """
         vqe_options = {"molecule": mol_H4_sto3g_uhf_a1_frozen, "ansatz": BuiltInAnsatze.UCCSD, "qubit_mapping": "scbk",
                         "initial_var_params": [0.001]*15, "verbose": False, "up_then_down": True}

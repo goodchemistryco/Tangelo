@@ -70,6 +70,7 @@ class SecondQuantizedDMETFragment:
 
         self.n_mos = len(self.mean_field.mo_energy[0]) if self.uhf else len(self.mean_field.mo_energy)
         self.mo_occ = self.mean_field.mo_occ
+        self.symmetry = False
 
         list_of_active_frozen = convert_frozen_orbitals(self, self.frozen_orbitals)
         self.active_occupied = list_of_active_frozen[0]

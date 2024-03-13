@@ -28,8 +28,10 @@ Refs:
         Physical Review A 95, 020501 (2017).
 """
 
+from typing import Union
+from copy import deepcopy
+
 import numpy as np
-from openfermion.circuits import uccsd_singlet_generator
 
 from tangelo import SecondQuantizedMolecule
 from tangelo.linq import Circuit
@@ -37,9 +39,11 @@ from tangelo.helpers.utils import is_package_installed
 from tangelo.toolboxes.qubit_mappings.mapping_transform import fermion_to_qubit_mapping
 from tangelo.toolboxes.qubit_mappings.statevector_mapping import get_reference_circuit
 from tangelo.toolboxes.molecular_computation import IntegralSolverPySCF
+from tangelo.toolboxes.operators import QubitOperator
 from .ansatz import Ansatz
 from .ansatz_utils import exp_pauliword_to_gates
 from ._unitary_cc_openshell import uccsd_openshell_paramsize, uccsd_openshell_generator
+from ._unitary_cc import uccsd_singlet_generator
 
 
 class UCCSD(Ansatz):
@@ -59,9 +63,9 @@ class UCCSD(Ansatz):
             attributes. Default, "HF".
     """
 
-    def __init__(self, molecule, mapping="JW", up_then_down=False, spin=None, reference_state="HF"):
+    def __init__(self, molecule: SecondQuantizedMolecule, mapping: str = "JW", up_then_down: bool = False, spin: Union[int, None] = None, reference_state="HF"):
 
-        self.molecule = molecule
+        self.molecule: SecondQuantizedMolecule = molecule
         self.n_spinorbitals = molecule.n_active_sos
         self.n_electrons = molecule.n_active_electrons
         self.spin = molecule.active_spin if spin is None else spin
@@ -82,15 +86,23 @@ class UCCSD(Ansatz):
                 self.n_orb_a = self.n_spinorbitals//2
                 self.n_orb_b = self.n_spinorbitals//2
             self.n_singles, self.n_doubles, _, _, _, _, _ = uccsd_openshell_paramsize(self.n_alpha, self.n_beta, self.n_orb_a, self.n_orb_b)
+            # set total number of parameters
+            # TODO UHF or ROHF symmetry adapated.
+            self.n_var_params = self.n_singles + self.n_doubles
+            self.params2keep = list(range(self.n_var_params))
         else:
             self.n_spatial_orbitals = self.n_spinorbitals // 2
             self.n_occupied = int(np.ceil(self.n_electrons / 2))
             self.n_virtual = self.n_spatial_orbitals - self.n_occupied
             self.n_singles = self.n_occupied * self.n_virtual
             self.n_doubles = self.n_singles * (self.n_singles + 1) // 2
+            # Determine parameters to keep depending on irreducible representation. If no symmetry, all are kept
+            self._singlet_symmetry_mask()
+            # Set total number of possibly symmetry reduced parameters
+            self.n_var_params = len(self.params2keep)
 
-        # set total number of parameters
-        self.n_var_params = self.n_singles + self.n_doubles
+        # Set number of possible var params, can be higher than n_var_params
+        self.n_full_var_params = self.n_singles + self.n_doubles
 
         # Supported reference state initialization
         # TODO: support for others
@@ -124,14 +136,16 @@ class UCCSD(Ansatz):
             elif var_params == "random":
                 initial_var_params = 2.e-1 * (np.random.random((self.n_var_params,)) - 0.5)
             elif var_params == "mp2":
-                initial_var_params = self._compute_mp2_params()
+                initial_var_params = self._compute_mp2_params()[self.params2keep]
         else:
             initial_var_params = np.array(var_params)
             if initial_var_params.size != self.n_var_params:
                 raise ValueError(f"Expected {self.n_var_params} variational parameters but "
                                  f"received {initial_var_params.size}.")
-        self.var_params = initial_var_params
-        return initial_var_params
+
+        self.var_params = np.zeros(self.n_full_var_params)
+        self.var_params[self.params2keep] = initial_var_params
+        return list(initial_var_params)
 
     def prepare_reference_state(self):
         """Returns circuit preparing the reference state of the ansatz (e.g
@@ -211,19 +225,69 @@ class UCCSD(Ansatz):
         Returns:
             QubitOperator: qubit-encoded elements of the UCCSD ansatz.
         """
-        fermion_op = uccsd_singlet_generator(self.var_params, self.n_spinorbitals, self.n_electrons)
-        qubit_op = fermion_to_qubit_mapping(fermion_operator=fermion_op,
-                                            mapping=self.mapping,
-                                            n_spinorbitals=self.n_spinorbitals,
-                                            n_electrons=self.n_electrons,
-                                            up_then_down=self.up_then_down,
-                                            spin=self.spin)
+        if not hasattr(self, "param_dict"):
+            self._singlet_symmetry_mask()
+
+        qubit_op = QubitOperator()
+        for key in self.params2keep:
+            # Obtain corresponding excitation
+            value = self.param_dict[key]
+            # Somehow the operator_dict[value] gets modified by multiplication
+            qubit_op += fermion_to_qubit_mapping(fermion_operator=deepcopy(self.operator_dict[value])*self.var_params[key],
+                                                 mapping=self.mapping,
+                                                 n_spinorbitals=self.n_spinorbitals,
+                                                 n_electrons=self.n_electrons,
+                                                 up_then_down=self.up_then_down,
+                                                 spin=self.spin)
 
         # Cast all coefs to floats (rotations angles are real)
         for key in qubit_op.terms:
             qubit_op.terms[key] = float(qubit_op.terms[key].imag)
         qubit_op.compress()
         return qubit_op
+
+    def _singlet_symmetry_mask(self):
+        """Generate the mapping between the full packed amplitude list and those retained for the circuit"""
+        self.param_dict, self.operator_dict = uccsd_singlet_generator(self.n_spinorbitals, self.n_electrons)
+
+        # If symmetry is present, only keep parameters that have the original irreduciple representation.
+        if self.molecule.symmetry:
+
+            # Obtain the symmetry ids for each molecular orbital
+            mo_ids = [self.molecule.mo_symm_ids[i] for i in self.molecule.active_occupied+self.molecule.active_virtual]
+
+            # Go through each excitation operator and determine the result irrep.
+            params2keep = []
+            for key, value in self.param_dict.items():
+                # Generate the reference configuration. The irrep is always 0 for a singlet
+                ref_occ = [list(range(self.n_occupied)), list(range(self.n_occupied))]
+                if len(value) == 2:
+                    ref_occ[0].remove(value[1])
+                    ref_occ[0] += [value[0]]
+                    irrep = 0
+                    for s in range(2):
+                        for occ in ref_occ[s]:
+                            irrep ^= mo_ids[occ]
+                    # If the irrep stays 0, that parameter can contribute
+                    if irrep == 0:
+                        params2keep += [key]
+                else:
+                    ref_occ[0].remove(value[1])
+                    ref_occ[0] += [value[0]]
+                    ref_occ[1].remove(value[3])
+                    ref_occ[1] += [value[2]]
+                    irrep = 0
+                    for s in range(2):
+                        for occ in ref_occ[s]:
+                            irrep ^= mo_ids[occ]
+                    # If the irrep stays 0, that parameter can contribute
+                    if irrep == 0:
+                        params2keep += [key]
+            self.params2keep = params2keep
+
+        # Keep all parameters
+        else:
+            self.params2keep = list(range(len(self.param_dict)))
 
     def _get_openshell_qubit_operator(self):
         """Construct open-shell UCCSD FermionOperator for current variational
@@ -282,4 +346,4 @@ class UCCSD(Ansatz):
         mp2 = MP2Solver(pymol)
         mp2.simulate()
 
-        return mp2.get_mp2_amplitudes()
+        return np.array(mp2.get_mp2_amplitudes())
